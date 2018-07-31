@@ -82,7 +82,7 @@ def _int64_feature(value):
 
 def _bytes_feature(value):
     """Wrapper for inserting a bytes Feature into a SequenceExample proto."""
-    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[bytes(str(value), "utf-8")]))
+    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
 
 
 def _int64_feature_list(values):
@@ -116,7 +116,7 @@ def _to_sequence_example(image, decoder, vocab):
         return
 
     context = tf.train.Features(feature={
-        "image/filename": _bytes_feature(image.filename),
+        "image/filename": _bytes_feature(bytes(image.filename, "utf-8")),
         "image/data": _bytes_feature(encoded_image),
         "image/category": _int64_feature(vocab.word_to_id(image.category.strip().lower())),
     })
