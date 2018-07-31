@@ -21,7 +21,6 @@ import threading
 
 import nltk.tokenize
 import numpy as np
-from six.moves import xrange
 import tensorflow as tf
 import glove
 import glove.configuration
@@ -117,12 +116,12 @@ def _to_sequence_example(image, decoder, vocab):
         return
 
     context = tf.train.Features(feature={
-        "image/category": _int64_feature(vocab.word_to_id(image.category.strip().lower())),
+        "image/filename": _bytes_feature(image.filename),
         "image/data": _bytes_feature(encoded_image),
+        "image/category": _int64_feature(vocab.word_to_id(image.category.strip().lower())),
     })
     attribute_ids = [vocab.word_to_id(a.strip().lower()) for a in image.attributes]
     feature_lists = tf.train.FeatureLists(feature_list={
-        "image/filename": _bytes_feature_list(image.filename),
         "image/attributes": _int64_feature_list(attribute_ids)
     })
     sequence_example = tf.train.SequenceExample(
@@ -210,7 +209,7 @@ def _process_dataset(name, images, vocab, num_shards):
     spacing = np.linspace(0, len(images), num_threads + 1).astype(np.int)
     ranges = []
     threads = []
-    for i in xrange(len(spacing) - 1):
+    for i in range(len(spacing) - 1):
         ranges.append([spacing[i], spacing[i + 1]])
 
     # Create a mechanism for monitoring when all threads are finished.
