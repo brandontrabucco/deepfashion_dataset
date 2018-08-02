@@ -17,6 +17,7 @@ import os.path
 import random
 import sys
 import threading
+import copy
 
 
 import nltk.tokenize
@@ -41,6 +42,10 @@ tf.flags.DEFINE_integer("test_shards", 8,
 
 tf.flags.DEFINE_integer("num_threads", 8,
                         "Number of threads to preprocess the images.")
+tf.flags.DEFINE_integer("partition_size", 128,
+                        "Number of threads to preprocess the images.")
+tf.flags.DEFINE_integer("num_repeats", 1,
+                        "Number of threads to preprocess the images.")
 
 FLAGS = tf.flags.FLAGS
 
@@ -49,11 +54,12 @@ class ImageMetadata(object):
     """Helper class for organizing images by annotations.
     """
     
-    def __init__(self, partition, filename, category, attributes):
+    def __init__(self, partition, filename, category, attributes, labels):
         self.partition = partition
         self.filename = filename
         self.category = category
         self.attributes = attributes
+        self.labels = labels
 
 
 class ImageDecoder(object):
@@ -118,11 +124,11 @@ def _to_sequence_example(image, decoder, vocab):
     context = tf.train.Features(feature={
         "image/filename": _bytes_feature(bytes(image.filename, "utf-8")),
         "image/data": _bytes_feature(encoded_image),
-        "image/category": _int64_feature(vocab.word_to_id(image.category.strip().lower())),
+        "image/category": _int64_feature(image.category),
     })
-    attribute_ids = [vocab.word_to_id(a.strip().lower()) for a in image.attributes]
     feature_lists = tf.train.FeatureLists(feature_list={
-        "image/attributes": _int64_feature_list(attribute_ids)
+        "image/attributes": _int64_feature_list(image.attributes),
+        "image/labels": _int64_feature_list(image.labels)
     })
     sequence_example = tf.train.SequenceExample(
         context=context, feature_lists=feature_lists)
@@ -232,7 +238,7 @@ def _process_dataset(name, images, vocab, num_shards):
         (datetime.now(), len(images), name))
 
 
-def _load_and_process_metadata(all_dir):
+def _load_and_process_metadata(all_dir, vocab):
     """Loads image metadata from txt files and process annotations.
 
     Args:
@@ -258,7 +264,7 @@ def _load_and_process_metadata(all_dir):
         filename = columns[0]
         partition = columns[1]
         images_hashmap[filename] = ImageMetadata(
-            partition=partition, filename=filename, category=None, attributes=[])
+            partition=partition, filename=filename, category=None, attributes=[], labels=[])
         
     # Load the category names into memory.
     with tf.gfile.FastGFile(os.path.join(all_dir, "Anno/list_category_cloth.txt"), "r") as f:
@@ -284,7 +290,7 @@ def _load_and_process_metadata(all_dir):
         columns = element.split()
         filename = columns[0]
         category = category_names[int(columns[1])]
-        images_hashmap[filename].category = category
+        images_hashmap[filename].category = vocab.word_to_id(category.lower().strip())
         
     # Load the attributes names into memory.
     with tf.gfile.FastGFile(os.path.join(all_dir, "Anno/list_attr_cloth.txt"), "r") as f:
@@ -294,7 +300,7 @@ def _load_and_process_metadata(all_dir):
     num_attrs = int(attribute_name_lines.pop(0).strip())
     header_attr = attribute_name_lines.pop(0).split()
     assert len(attribute_name_lines) == num_attrs, "Wrong number of attributes."
-    attribute_names = list(map((lambda s: s.split()[0].lower()), attribute_name_lines))
+    attribute_names = list(map((lambda s: s.lower().split()[0:-1]), attribute_name_lines))
         
     # Load the attribute labels into memory.
     with tf.gfile.FastGFile(os.path.join(all_dir, "Anno/list_attr_img.txt"), "r") as f:
@@ -309,8 +315,14 @@ def _load_and_process_metadata(all_dir):
     for element in attribute_lines:
         columns = element.split()
         filename = columns[0]
-        attributes = [attribute_names[int(x)] for x in columns[1:]]
-        images_hashmap[filename].attributes = attributes
+        attributes = []
+        for x, v in enumerate(columns[1:]):
+            if int(v) == 1:
+                attributes.extend(attribute_names[int(x)])
+        attribute_ids = [vocab.word_to_id(a.strip().lower()) for a in attributes]
+        attribute_ids = [x for x in attribute_ids if x != vocab.unk_id]
+        images_hashmap[filename].attributes = attribute_ids
+        images_hashmap[filename].labels = [1 for _ in attribute_ids]
         
     # Separate the partitions based on name.
     train_image_metadata = [value for value in images_hashmap.values() if value.partition == "train"]
@@ -321,6 +333,36 @@ def _load_and_process_metadata(all_dir):
         (num_images, all_dir))
 
     return train_image_metadata, val_image_metadata, test_image_metadata
+
+
+def _add_negative_examples(image_metadata, vocab_size, partition_size, num_duplicates=1):
+    """Adds duplicates of each example with negative examples included.
+    
+    Args:
+        image_metadata: list of ImageMetadata objects.
+        vocab_size: number of words in the vocabulary
+        partition_size: the size of the attributes list to fill
+        num_duplicates: The number of samples for a single image.
+        
+    Returns:
+        negative_examples: list of ImageMetadata oobjects with negative examples.
+    """ 
+    all_metadata = []
+    partition_size = min(partition_size, vocab_size)
+    for example in image_metadata:
+        
+        # method relies on high probability that random attributes not present
+        for _ in range(num_duplicates):
+            negative_attributes = np.random.randint( 
+                0, high=vocab_size, size=(partition_size - len(example.attributes))).tolist()
+            zero_labels = np.zeros(partition_size - len(example.attributes), dtype=np.int32).tolist()
+
+            image_buffer = copy.deepcopy(example)
+            image_buffer.attributes.extend(negative_attributes)
+            image_buffer.labels.extend(zero_labels)
+            all_metadata.append(image_buffer)
+            
+    return all_metadata
 
 
 def main(unused_argv):
@@ -338,9 +380,6 @@ def main(unused_argv):
     if not tf.gfile.IsDirectory(FLAGS.output_dir):
         tf.gfile.MakeDirs(FLAGS.output_dir)
 
-    # Load image metadata from caption files.
-    train_dataset, val_dataset, test_dataset = _load_and_process_metadata(FLAGS.all_dir)
-
     # Create vocabulary from the glove embeddings.
     config = glove.configuration.Configuration(
         embedding=300,
@@ -350,6 +389,18 @@ def main(unused_argv):
         end_word="</S>",
         unk_word="<UNK>")
     vocab = glove.load(config)[0]
+
+    # Load image metadata from caption files.
+    train_dataset, val_dataset, test_dataset = _load_and_process_metadata(FLAGS.all_dir, vocab)
+    
+    # Add negative examples.
+    vocab_size = len(vocab.reverse_vocab)
+    train_dataset = _add_negative_examples(train_dataset, vocab_size, 
+                                           FLAGS.partition_size, FLAGS.num_repeats)
+    val_dataset = _add_negative_examples(val_dataset, vocab_size, 
+                                         FLAGS.partition_size, FLAGS.num_repeats)
+    test_dataset = _add_negative_examples(test_dataset, vocab_size, 
+                                          FLAGS.partition_size, FLAGS.num_repeats)
 
     _process_dataset("train", train_dataset, vocab, FLAGS.train_shards)
     _process_dataset("val", val_dataset, vocab, FLAGS.val_shards)
